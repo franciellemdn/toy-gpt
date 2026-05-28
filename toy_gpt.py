@@ -13,6 +13,7 @@ import argparse
 import math
 import os
 import sys
+import urllib.request
 from contextlib import nullcontext
 import torch
 import torch.nn as nn
@@ -146,6 +147,11 @@ class ToyGPT(nn.Module):
         self.blocks  = nn.Sequential(*[Block() for _ in range(N_LAYERS)])
         self.ln_f    = nn.LayerNorm(N_EMBED)
         self.lm_head = nn.Linear(N_EMBED, vocab_size)
+        
+        # Tie input embeddings and language model head weights
+        # (https://arxiv.org/abs/1608.05859)
+        self.lm_head.weight = self.token_embedding.weight
+        
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -187,6 +193,18 @@ class ToyGPT(nn.Module):
 # -----------------------------------------------------------------------------
 # Training / data plumbing
 # -----------------------------------------------------------------------------
+def download_corpus(url, filename):
+    if not os.path.exists(filename):
+        print(f"Downloading corpus from {url} to {filename}...")
+        try:
+            urllib.request.urlretrieve(url, filename)
+            print("Download completed successfully.")
+        except Exception as e:
+            print(f"Failed to download corpus: {e}")
+            return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default=None,
@@ -209,6 +227,10 @@ def main():
                         help="Compile the model using torch.compile (requires PyTorch 2.0+).")
     parser.add_argument("--amp", action="store_true",
                         help="Use mixed precision (automatic mixed precision) training on CUDA.")
+    parser.add_argument("--tokenizer", type=str, default="gpt2", choices=["char", "gpt2"],
+                        help="Tokenizer to use: 'char' or 'gpt2' subword tokenizer.")
+    parser.add_argument("--weight_decay", type=float, default=1e-1,
+                        help="Weight decay coefficient.")
     args = parser.parse_args()
 
     torch.manual_seed(SEED)
@@ -239,20 +261,21 @@ def main():
             with open(args.data, "r", encoding="utf-8") as f:
                 raw_text = f.read()
         else:
-            print(f"Warning: --data path '{args.data}' not found. Falling back to built-in text.")
+            print(f"Warning: --data path '{args.data}' not found. Falling back to downloading Tiny Shakespeare.")
     
     if raw_text is None:
-        raw_text = FALLBACK_TEXT
-        print("Using the tiny built-in corpus.")
+        shakespeare_url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+        shakespeare_file = "tinyshakespeare.txt"
+        if download_corpus(shakespeare_url, shakespeare_file):
+            with open(shakespeare_file, "r", encoding="utf-8") as f:
+                raw_text = f.read()
+        else:
+            print("Falling back to built-in tiny Shakespeare excerpt.")
+            raw_text = FALLBACK_TEXT
 
-    # Set up default mappings from the corpus
-    chars = sorted(set(raw_text))
-    vocab_size = len(chars)
-    stoi = {c: i for i, c in enumerate(chars)}
-    itos = {i: c for i, c in enumerate(chars)}
-
-    # Check for checkpoints to resume or evaluate
+    # Check for checkpoints to resume or evaluate and restore tokenizer type
     checkpoint = None
+    tokenizer_type = args.tokenizer
     if args.resume or args.eval_only:
         possible_paths = [
             os.path.join(args.checkpoint_dir, "ckpt_best.pt"),
@@ -267,15 +290,47 @@ def main():
         if os.path.exists(selected_path):
             print(f"Loading checkpoint from {selected_path}...")
             checkpoint = torch.load(selected_path, map_location=device)
-            stoi = checkpoint['stoi']
-            itos = checkpoint['itos']
-            vocab_size = checkpoint['vocab_size']
-            print(f"Loaded vocabulary with size {vocab_size} from checkpoint.")
+            tokenizer_type = checkpoint.get('tokenizer_type', 'char')
+            print(f"Restored tokenizer: '{tokenizer_type}' from checkpoint.")
         else:
             if args.eval_only:
                 print(f"Error: Could not find checkpoint at {args.checkpoint_dir} for evaluation.")
                 sys.exit(1)
             print(f"No checkpoint found at {args.checkpoint_dir}. Starting training from scratch.")
+
+    # Setup tokenization
+    if tokenizer_type == "gpt2":
+        import tiktoken
+        enc = tiktoken.get_encoding("gpt2")
+        encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+        decode = lambda l: enc.decode(l)
+        vocab_size = 50257
+        print(f"Using GPT-2 BPE tokenizer. Vocab size: {vocab_size}")
+    else:
+        # Character-level tokenizer
+        if checkpoint is not None:
+            stoi = checkpoint['stoi']
+            itos = checkpoint['itos']
+            vocab_size = checkpoint['vocab_size']
+        else:
+            chars = sorted(set(raw_text))
+            vocab_size = len(chars)
+            stoi = {c: i for i, c in enumerate(chars)}
+            itos = {i: c for i, c in enumerate(chars)}
+            
+        def encode(s):
+            out = []
+            skipped = set()
+            for c in s:
+                if c in stoi:
+                    out.append(stoi[c])
+                else:
+                    skipped.add(c)
+            if skipped:
+                print(f"Warning: skipped {len(skipped)} characters not in vocabulary: {list(skipped)[:5]}...")
+            return out
+        decode = lambda l: "".join(itos[i] for i in l)
+        print(f"Using Character-level tokenizer. Vocab size: {vocab_size}")
 
     # --- build model ---
     model = ToyGPT(vocab_size).to(device)
@@ -283,8 +338,16 @@ def main():
     start_iter = 0
     best_val_loss = float('inf')
 
-    # Create optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    # Custom optimizer with weight decay exclusion for 1D parameters
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': args.weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+    optimizer = torch.optim.AdamW(optim_groups, lr=LEARNING_RATE)
 
     # Load weights if resuming/evaluating
     if checkpoint is not None:
@@ -306,22 +369,8 @@ def main():
     print(f"Model parameters: {n_params/1e6:.2f}M")
 
     # --- encode data ---
-    def encode(s):
-        out = []
-        skipped = set()
-        for c in s:
-            if c in stoi:
-                out.append(stoi[c])
-            else:
-                skipped.add(c)
-        if skipped:
-            print(f"Warning: skipped {len(skipped)} characters not in vocabulary: {list(skipped)[:5]}...")
-        return out
-        
-    decode = lambda l: "".join(itos[i] for i in l)
-    
     encoded_data = encode(raw_text)
-    print(f"Corpus: {len(raw_text)} chars, encoded {len(encoded_data)} chars, vocab size: {vocab_size}")
+    print(f"Corpus: {len(raw_text)} chars, encoded {len(encoded_data)} tokens, vocab size: {vocab_size}")
 
     data = torch.tensor(encoded_data, dtype=torch.long)
     n = int(0.9 * len(data))
@@ -370,9 +419,11 @@ def main():
             'iter_num': current_iter,
             'best_val_loss': current_best_loss,
             'vocab_size': vocab_size,
-            'stoi': stoi,
-            'itos': itos,
+            'tokenizer_type': tokenizer_type,
         }
+        if tokenizer_type == "char":
+            checkpoint_data['stoi'] = stoi
+            checkpoint_data['itos'] = itos
         torch.save(checkpoint_data, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
 
@@ -402,10 +453,13 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
     else:
         print("Running in --eval_only mode.")
@@ -418,11 +472,17 @@ def main():
         print(f"Generating from prompt: {repr(args.prompt)}")
         prompt_encoded = encode(args.prompt)
         if not prompt_encoded:
-            prompt_encoded = [stoi.get('\n', 0)]
+            if tokenizer_type == "char":
+                prompt_encoded = [stoi.get('\n', 0)]
+            else:
+                prompt_encoded = [13]
         start = torch.tensor([prompt_encoded], dtype=torch.long, device=device)
     else:
-        start_char = '\n' if '\n' in stoi else list(stoi.keys())[0]
-        start = torch.tensor([[stoi[start_char]]], dtype=torch.long, device=device)
+        if tokenizer_type == "char":
+            start_char = '\n' if '\n' in stoi else list(stoi.keys())[0]
+            start = torch.tensor([[stoi[start_char]]], dtype=torch.long, device=device)
+        else:
+            start = torch.tensor([[13]], dtype=torch.long, device=device)
         
     raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
     out = raw_model.generate(start, max_new_tokens=args.num_samples)[0].tolist()
