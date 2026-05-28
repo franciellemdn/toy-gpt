@@ -43,7 +43,8 @@ def main():
         sys.exit(1)
 
     print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    with open(checkpoint_path, 'rb') as f:
+        checkpoint = torch.load(f, map_location=device)
     
     # Restore tokenizer and vocabulary size
     tokenizer_type = checkpoint.get('tokenizer_type', 'char')

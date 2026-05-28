@@ -88,7 +88,8 @@ def main():
         checkpoint_path = os.path.join(args.checkpoint_dir, "ckpt_latest.pt")
         if os.path.exists(checkpoint_path):
             print(f"Loading checkpoint from {checkpoint_path}...")
-            checkpoint = torch.load(checkpoint_path, map_location=device)
+            with open(checkpoint_path, 'rb') as f:
+                checkpoint = torch.load(f, map_location=device)
             tokenizer_type = checkpoint.get('tokenizer_type', 'char')
             print(f"Restored tokenizer: '{tokenizer_type}' from checkpoint.")
         else:
@@ -206,7 +207,11 @@ def main():
         if tokenizer_type == "char":
             checkpoint_data['stoi'] = stoi
             checkpoint_data['itos'] = itos
-        torch.save(checkpoint_data, ckpt_path)
+            
+        # Save to a temporary file first and then replace to avoid locked file errors on Windows
+        temp_path = ckpt_path + ".tmp"
+        torch.save(checkpoint_data, temp_path)
+        os.replace(temp_path, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
 
     # --- Train ---
