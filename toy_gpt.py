@@ -13,6 +13,7 @@ import argparse
 import math
 import os
 import sys
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -202,13 +203,34 @@ def main():
                         help="Number of characters to generate.")
     parser.add_argument("--max_iters", type=int, default=MAX_ITERS,
                         help="Maximum training iterations.")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Device to use: 'cuda', 'mps', or 'cpu'. Defaults to auto-detect.")
+    parser.add_argument("--compile", action="store_true",
+                        help="Compile the model using torch.compile (requires PyTorch 2.0+).")
+    parser.add_argument("--amp", action="store_true",
+                        help="Use mixed precision (automatic mixed precision) training on CUDA.")
     args = parser.parse_args()
 
     torch.manual_seed(SEED)
-    device = ("cuda" if torch.cuda.is_available()
-              else "mps" if torch.backends.mps.is_available()
-              else "cpu")
+    if args.device:
+        device = args.device
+    else:
+        device = ("cuda" if torch.cuda.is_available()
+                  else "mps" if torch.backends.mps.is_available()
+                  else "cpu")
     print(f"Using device: {device}")
+
+    # Set up Automatic Mixed Precision (AMP) context and GradScaler if on CUDA
+    device_type = 'cuda' if 'cuda' in device else 'cpu'
+    if args.amp and device_type == 'cuda':
+        ctx = torch.amp.autocast(device_type=device_type, dtype=torch.float16)
+        scaler = torch.cuda.amp.GradScaler()
+        print("Using AMP (automatic mixed precision) training.")
+    else:
+        ctx = nullcontext()
+        scaler = None
+        if args.amp:
+            print("Warning: AMP requested but device is not CUDA. Running standard precision.")
 
     # --- load text / setup vocabulary ---
     raw_text = None
@@ -255,16 +277,16 @@ def main():
                 sys.exit(1)
             print(f"No checkpoint found at {args.checkpoint_dir}. Starting training from scratch.")
 
-    # --- build model & optimizer ---
+    # --- build model ---
     model = ToyGPT(vocab_size).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params/1e6:.2f}M")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
     start_iter = 0
     best_val_loss = float('inf')
 
+    # Create optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+
+    # Load weights if resuming/evaluating
     if checkpoint is not None:
         model.load_state_dict(checkpoint['model'])
         try:
@@ -274,6 +296,14 @@ def main():
         start_iter = checkpoint['iter_num'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         print(f"Resumed from step {start_iter} with best validation loss {best_val_loss:.4f}")
+
+    # --- compile model if requested (after checkpoint load) ---
+    if args.compile:
+        print("Compiling the model... (this may take a minute)")
+        model = torch.compile(model)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {n_params/1e6:.2f}M")
 
     # --- encode data ---
     def encode(s):
@@ -312,7 +342,8 @@ def main():
             losses = torch.zeros(EVAL_ITERS)
             for k in range(EVAL_ITERS):
                 xb, yb = get_batch(split)
-                _, loss = model(xb, yb)
+                with ctx:
+                    _, loss = model(xb, yb)
                 losses[k] = loss.item()
             out[split] = losses.mean().item()
         model.train()
@@ -332,8 +363,9 @@ def main():
     def save_checkpoint(filename, current_iter, current_best_loss):
         os.makedirs(args.checkpoint_dir, exist_ok=True)
         ckpt_path = os.path.join(args.checkpoint_dir, filename)
+        raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
         checkpoint_data = {
-            'model': model.state_dict(),
+            'model': raw_model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'iter_num': current_iter,
             'best_val_loss': current_best_loss,
@@ -362,13 +394,19 @@ def main():
                     save_checkpoint("ckpt_best.pt", it, best_val_loss)
 
             if it == args.max_iters:
-                break # We evaluate at max_iters and save, but don't perform another training step
+                break
 
             xb, yb = get_batch("train")
-            _, loss = model(xb, yb)
+            with ctx:
+                _, loss = model(xb, yb)
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
     else:
         print("Running in --eval_only mode.")
         losses = estimate_loss(model)
@@ -386,7 +424,8 @@ def main():
         start_char = '\n' if '\n' in stoi else list(stoi.keys())[0]
         start = torch.tensor([[stoi[start_char]]], dtype=torch.long, device=device)
         
-    out = model.generate(start, max_new_tokens=args.num_samples)[0].tolist()
+    raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    out = raw_model.generate(start, max_new_tokens=args.num_samples)[0].tolist()
     print(decode(out))
 
 

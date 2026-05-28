@@ -32,30 +32,40 @@ conda run -n base python toy_gpt.py
 ## 📖 Usage Guide
 
 ### 1. Basic Training
-Train on the built-in Shakespeare corpus using default hyperparameters:
+Train on the built-in Shakespeare corpus using default hyperparameters (automatically auto-detects CUDA/MPS/CPU):
 ```bash
 python toy_gpt.py
 ```
 
-### 2. Train on Your Custom Corpus
+### 2. High-Performance GPU Training (CUDA)
+For fast training on modern NVIDIA GPUs, you can enable mixed precision (AMP) and model compilation:
+```bash
+# Train on CUDA GPU using Mixed Precision (AMP) and compilation (PyTorch 2.0+)
+python toy_gpt.py --device cuda --amp --compile
+```
+* **`--device cuda`**: Forces PyTorch to target the NVIDIA CUDA backend.
+* **`--amp`**: Enables Automatic Mixed Precision (FP16), which reduces GPU memory usage and increases computing speeds.
+* **`--compile`**: Runs `torch.compile` to fuse operations and speed up execution (takes ~1 minute to compile on start).
+
+### 3. Train on Your Custom Corpus
 You can supply any plain-text file (e.g. a book, code dataset, or chat logs) using the `--data` flag:
 ```bash
 python toy_gpt.py --data path/to/my_data.txt
 ```
 
-### 3. Change Training Durations
+### 4. Change Training Durations
 Adjust training steps using the `--max_iters` parameter:
 ```bash
 python toy_gpt.py --max_iters 5000
 ```
 
-### 4. Resume Interrupted Training
+### 5. Resume Interrupted Training
 If training stops, you can resume from your last saved checkpoint (`ckpt_latest.pt`) by passing the `--resume` flag:
 ```bash
 python toy_gpt.py --resume --max_iters 6000
 ```
 
-### 5. Generate Text with Custom Prompts (Inference Only)
+### 6. Generate Text with Custom Prompts (Inference Only)
 To sample text without running training, use `--eval_only` and prime the model with a custom sentence:
 ```bash
 python toy_gpt.py --eval_only --prompt "To be, or not to be" --num_samples 300
