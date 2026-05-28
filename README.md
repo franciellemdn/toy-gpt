@@ -4,6 +4,26 @@ This repository contains a clean, educational, and highly optimized Generative P
 
 ---
 
+## 📂 Project Structure
+
+The project is organized into modular files to keep the model code, dataset handling, configuration, and execution flows clean and separate:
+
+```text
+toy-gpt/
+├── toy_gpt/                      # Core module package
+│   ├── __init__.py               # Re-exports key classes
+│   ├── config.py                 # Hyperparameter defaults (embed sizes, LR settings)
+│   ├── data.py                   # Corpus downloads, BPE and Character tokenizers
+│   └── model.py                  # PyTorch blocks (CausalSelfAttention, Block, ToyGPT)
+│
+├── train.py                      # Main training script (runs CUDA, AMP, compile)
+├── sample.py                     # Main generation/sampling script
+├── toy_gpt.py                    # Backwards-compatible legacy training wrapper
+└── requirements.txt              # Package dependencies (PyTorch, tiktoken)
+```
+
+---
+
 ## 🚀 Key Features
 
 * **Subword Tokenization (BPE)**: Supports both character-level tokenization and subword Byte-Pair Encoding (BPE) using OpenAI's `tiktoken` (defaults to the `gpt2` vocabulary of 50,257 tokens).
@@ -25,10 +45,11 @@ This repository contains a clean, educational, and highly optimized Generative P
    ```bash
    pip install -r requirements.txt
    ```
-2. Run the script (by default, it will automatically download Tiny Shakespeare and train using the `gpt2` subword tokenizer):
+2. Run training (by default, it will automatically download Tiny Shakespeare and train using the `gpt2` subword tokenizer):
    ```bash
-   python toy_gpt.py
+   python train.py
    ```
+   *(Note: You can also run `python toy_gpt.py` which acts as a backwards-compatible alias wrapper for `train.py`.)*
 
 ---
 
@@ -37,20 +58,20 @@ This repository contains a clean, educational, and highly optimized Generative P
 ### 1. Basic Training (BPE Subword Level)
 Trains on Tiny Shakespeare using the `gpt2` subword tokenizer (vocab size 50,257):
 ```bash
-python toy_gpt.py
+python train.py
 ```
 
 ### 2. Basic Training (Character Level)
 Trains on Tiny Shakespeare using a character-level tokenizer (vocab size 65):
 ```bash
-python toy_gpt.py --tokenizer char
+python train.py --tokenizer char
 ```
 
 ### 3. High-Performance GPU Training (CUDA)
 For fast training on modern NVIDIA GPUs, you can enable mixed precision (AMP) and model compilation:
 ```bash
 # Train on CUDA GPU using Mixed Precision (AMP) and compilation (PyTorch 2.0+)
-python toy_gpt.py --device cuda --amp --compile
+python train.py --device cuda --amp --compile
 ```
 * **`--device cuda`**: Forces PyTorch to target the NVIDIA CUDA backend.
 * **`--amp`**: Enables Automatic Mixed Precision (FP16), reducing GPU memory usage and increasing speeds.
@@ -59,24 +80,25 @@ python toy_gpt.py --device cuda --amp --compile
 ### 4. Train on Your Custom Corpus
 You can supply any plain-text file using the `--data` flag:
 ```bash
-python toy_gpt.py --data path/to/my_data.txt
+python train.py --data path/to/my_data.txt
 ```
 
 ### 5. Change Training Durations & Weight Decay
+You can customize model parameters directly via CLI flags:
 ```bash
-python toy_gpt.py --max_iters 5000 --weight_decay 0.05
+python train.py --max_iters 5000 --weight_decay 0.05 --n_layers 6 --n_embed 256
 ```
 
 ### 6. Resume Interrupted Training
 Automatically restores tokenizer settings and continues training from your last saved checkpoint (`ckpt_latest.pt`):
 ```bash
-python toy_gpt.py --resume --max_iters 6000
+python train.py --resume --max_iters 6000
 ```
 
-### 7. Generate Text with Custom Prompts (Inference Only)
-To sample text without training, use `--eval_only` and prime the model with a custom sentence:
+### 7. Generate Text (Inference Only)
+To sample text without training, use the dedicated generation script `sample.py` (which automatically restores the correct model size and tokenizer from the checkpoint metadata):
 ```bash
-python toy_gpt.py --eval_only --prompt "To be, or not to be" --num_samples 300
+python sample.py --prompt "To be, or not to be" --num_samples 300
 ```
 
 ---
